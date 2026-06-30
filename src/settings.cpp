@@ -36,6 +36,28 @@
 #include "openmc/weight_windows.h"
 #include "openmc/xml_interface.h"
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BEGIN INSERT A  ─  new #include directives
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+#ifdef OPENMC_LIBMESH_ENABLED
+// libMesh headers needed only by read_weight_windows_from_exodus().
+// All libMesh symbols are confined to this guard so non-libMesh builds
+// compile without change.
+#include "libmesh/replicated_mesh.h"   // ReplicatedMesh – reads .exo files
+#include "libmesh/exodusII_io.h"       // ExodusII_IO::read + read_elemental_var
+#include "libmesh/equation_systems.h"  // required by ExodusII_IO for var reading
+#include "libmesh/explicit_system.h"   // ExplicitSystem – lightweight container
+#include "libmesh/numeric_vector.h"    // NumericVector used by ExplicitSystem
+#include "libmesh/dof_map.h"           // DoFMap for per-element DOF lookup
+#endif // OPENMC_LIBMESH_ENABLED
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// END INSERT A
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+ 
+
 namespace openmc {
 
 //==============================================================================
@@ -381,6 +403,335 @@ void get_run_parameters(pugi::xml_node node_base)
   }
 }
 
+
+// -----------------------------------------------------------------------------
+// read_weight_windows_from_exodus
+//
+// Called by read_settings_xml() when a <weight_windows_from_exodus> node is
+// present in settings.xml.  The function:
+//   1. Parses XML fields.
+//   2. Loads the Exodus mesh via openmc::LibMesh; registers it in model::meshes.
+//   3. Reads the named elemental flux variable from the same Exodus file.
+//   4. Normalises the flux → lower_ww_bounds; scales → upper_ww_bounds.
+//   5. Synthesises an in-memory <weight_windows> pugi node and delegates
+//      construction to the existing WeightWindows::from_xml() path so that
+//      all ID management and registration logic is reused.
+//   6. Sets settings::weight_windows_on = true.
+// -----------------------------------------------------------------------------
+static void read_weight_windows_from_exodus(pugi::xml_node node)
+{
+#ifndef OPENMC_LIBMESH_ENABLED
+  // Hard error: the stanza was present but libMesh was not compiled in.
+  // Failing loudly prevents silent no-op behaviour.
+  fatal_error("<weight_windows_from_exodus> requires OpenMC to be compiled "
+              "with libMesh support (-DOPENMC_USE_LIBMESH=ON).");
+#else
+ 
+  // ── Step 1: Parse XML fields ──────────────────────────────────────────────
+ 
+  // <mesh_file> – path to the Exodus (.exo) file produced by the adjoint
+  // solver.  Required; fatal_error if absent or empty.
+  const std::string mesh_file =
+      get_node_value(node, "mesh_file", /*strip_whitespace=*/true);
+  if (mesh_file.empty())
+    fatal_error("<weight_windows_from_exodus>: <mesh_file> is required.");
+ 
+  // <adjoint_flux_variable> – the element-variable name in the Exodus file
+  // that holds the adjoint scalar flux.  Case-sensitive.
+  const std::string flux_var =
+      get_node_value(node, "adjoint_flux_variable", /*strip=*/true);
+  if (flux_var.empty())
+    fatal_error("<weight_windows_from_exodus>: "
+                "<adjoint_flux_variable> is required.");
+ 
+  // <energy_bounds> – at least two space-separated energy values in eV.
+  // For a single energy group: two values (E_lo E_hi).
+  const std::vector<double> energy_bounds =
+      get_node_array<double>(node, "energy_bounds");
+  if (energy_bounds.size() < 2)
+    fatal_error("<weight_windows_from_exodus>: "
+                "<energy_bounds> must contain at least two values.");
+ 
+  // <timestep> – 0-based Exodus time step index.  Sentinel -1 means "last".
+  // An absent element defaults to the last available time step.
+  const int ts_user = check_for_node(node, "timestep")
+      ? std::stoi(get_node_value(node, "timestep", true))
+      : -1;  // -1 → resolve to last step after opening the file
+ 
+  // <survival_ratio> – weight-window roulette ratio (default 3.0).
+  const double survival_ratio = check_for_node(node, "survival_ratio")
+      ? std::stod(get_node_value(node, "survival_ratio", true))
+      : 3.0;
+ 
+  // <upper_bound_ratio> – upper_ww = lower_ww * this factor (default 5.0).
+  const double upper_bound_ratio = check_for_node(node, "upper_bound_ratio")
+      ? std::stod(get_node_value(node, "upper_bound_ratio", true))
+      : 5.0;
+ 
+  // ── Step 2: Load the Exodus mesh; register as openmc::LibMesh ────────────
+  //
+  // openmc::LibMesh (src/mesh.cpp) wraps a libMesh::ReplicatedMesh, builds a
+  // PointLocator, and is the canonical unstructured-mesh type for OpenMC.  We
+  // construct it exactly as read_meshes() does for <mesh type="unstructured">
+  // nodes, so the mesh is a proper first-class citizen: it appears in the
+  // statepoint, can be used as a tally filter, and its point-locator is ready
+  // for particle tracking.
+ 
+  // Verify the file exists early; the libMesh error for a missing file is
+  // cryptic, so we give a cleaner message.
+  if (!file_exists(mesh_file))
+    fatal_error(fmt::format(
+        "<weight_windows_from_exodus>: mesh file '{}' does not exist.",
+        mesh_file));
+ 
+  // ── Step 2a: Read flux variable using a standalone ReplicatedMesh ─────────
+  //
+  // openmc::LibMesh does NOT expose its internal libMesh::MeshBase (there is no
+  // libmesh_mesh() accessor on that class).  The clean solution is to open the
+  // Exodus file once in a fully independent libMesh::ReplicatedMesh that we own,
+  // extract the adjoint flux values from it, then discard it.  After that we
+  // pass the same file path to openmc::LibMesh, which re-reads it for transport.
+  // The two ReplicatedMesh instances are independent objects that both represent
+  // the same Exodus geometry; the element traversal order is identical between
+  // them, which preserves the bin-index correspondence (see ordering guarantee
+  // below).
+  //
+  // Ordering guarantee
+  // ──────────────────
+  // ExodusII_IO::copy_elemental_solution() populates DOFs by iterating
+  // active_element_ptr_range() in ascending element-ID order on a
+  // ReplicatedMesh.  openmc::LibMesh::get_bin() identifies bins by the same
+  // traversal (it stores the first active element ID and maps
+  //   bin = elem->id() - first_elem_id).
+  // Because both meshes are loaded from the same Exodus file without any
+  // renumbering, their element IDs are identical and the traversal order matches.
+  // Therefore DOF index k from our standalone mesh == weight-window bin k in
+  // OpenMC, with no re-ordering step.
+ 
+  std::vector<double> flux;  // filled below; size = n_active_elements
+  int n_elem = 0;
+  int n_steps_saved = 1; // set inside the scope block below
+  {
+    // Standalone ReplicatedMesh — scoped so it is destroyed before the
+    // openmc::LibMesh object is created, freeing memory early.
+    // ReplicatedMesh requires a libMesh::Parallel::Communicator reference.
+    // settings::libmesh_comm is a const libMesh::Parallel::Communicator* set
+    // during initialize.cpp and used by all mesh construction in openmc.
+    // This is identical to how openmc::LibMesh constructs its own mesh.
+    
+    libMesh::ReplicatedMesh standalone_mesh(*settings::libmesh_comm);
+ 
+    // allow_renumbering(false) MUST be called before read().
+    // copy_elemental_solution maps Exodus element-block entries to DOFs by
+    // element ID.  If the mesh is renumbered those IDs change and the mapping
+    // is wrong (segfault or silent wrong values).  Setting this flag before
+    // read() prevents renumbering during both read() and prepare_for_use().
+    standalone_mesh.allow_renumbering(false);
+ 
+    // Use a single ExodusII_IO object for both the mesh read and the later
+    // copy_elemental_solution call.  Constructing a second ExodusII_IO and
+    // calling read() again on an already-populated mesh causes a segfault
+    // because the internal Exodus file handle and element maps are rebuilt
+    // inconsistently.  One object, one read, one copy — that is the correct
+    // libMesh pattern.
+    libMesh::ExodusII_IO exo_reader(standalone_mesh);
+    exo_reader.read(mesh_file);
+    standalone_mesh.prepare_for_use();
+ 
+    // Count active elements and verify the mesh is non-empty.
+    n_elem = static_cast<int>(standalone_mesh.n_active_elem());
+    if (n_elem == 0)
+      fatal_error(fmt::format(
+          "<weight_windows_from_exodus>: mesh file '{}' has no elements.",
+          mesh_file));
+ 
+    // Attach a throw-away EquationSystems / ExplicitSystem so that
+    // ExodusII_IO::copy_elemental_solution() has somewhere to write the data.
+    libMesh::EquationSystems eq_sys(standalone_mesh);
+    auto& sys = eq_sys.add_system<libMesh::ExplicitSystem>("adjoint_ww");
+ 
+    // CONSTANT MONOMIAL: one scalar DOF per active element — matches how
+    // MOOSE/Griffin writes element-averaged scalar fluxes.
+    sys.add_variable(flux_var, libMesh::CONSTANT, libMesh::MONOMIAL);
+    eq_sys.init();  // allocate the DOF vectors
+ 
+    // Verify the variable is present in the file.
+    const auto& exo_elem_vars = exo_reader.get_elem_var_names();
+    if (std::find(exo_elem_vars.begin(), exo_elem_vars.end(), flux_var)
+        == exo_elem_vars.end()) {
+      // Build comma-separated list of available variable names for the error msg.
+      std::string available_vars;
+      for (std::size_t vi = 0; vi < exo_elem_vars.size(); ++vi) {
+        if (vi) available_vars += ", ";
+        available_vars += exo_elem_vars[vi];
+      }
+      fatal_error(fmt::format(
+          "<weight_windows_from_exodus>: variable '{}' not found in '{}'.\n"
+          "  Available element variables: [{}]",
+          flux_var, mesh_file, available_vars));
+    }
+ 
+    // Resolve time step.  Exodus uses 1-based step indices internally.
+    const int n_steps = static_cast<int>(exo_reader.get_time_steps().size());
+    // ts_user is 0-based (-1 = last).  Convert to 1-based for libMesh.
+    const int ts_1based = (ts_user < 0) ? n_steps : (ts_user + 1);
+    if (ts_1based < 1 || ts_1based > n_steps)
+      fatal_error(fmt::format(
+          "<weight_windows_from_exodus>: requested timestep {} is out of range "
+          "[0, {}) for file '{}'.",
+          (ts_user < 0 ? n_steps - 1 : ts_user), n_steps, mesh_file));
+ 
+    // Populate the ExplicitSystem solution with the adjoint flux values.
+    exo_reader.copy_elemental_solution(sys, flux_var, flux_var, ts_1based);
+ 
+    // Extract per-element values in ascending element-ID order.
+    // CONSTANT MONOMIAL → exactly one DOF per element → dof_indices[0].
+    const libMesh::DofMap& dof_map = sys.get_dof_map();
+    flux.resize(n_elem, 0.0);
+    int bin = 0;
+    for (const auto* elem : standalone_mesh.active_element_ptr_range()) {
+      std::vector<libMesh::dof_id_type> dofs;
+      dof_map.dof_indices(elem, dofs);
+      flux[bin++] = sys.solution->el(dofs[0]);
+    }
+    // Save n_steps for later use in write_message (outside this scope).
+    n_steps_saved = n_steps;
+    // standalone_mesh and eq_sys destruct here; memory is freed.
+  }
+ 
+  // ── Step 2b: Register the Exodus mesh with OpenMC ─────────────────────────
+  //
+  // Now construct the openmc::LibMesh wrapper (which re-reads the same Exodus
+  // file and builds the PointLocator for transport).  We assign it a fresh ID
+  // and register it in model::meshes exactly as read_meshes() does in mesh.cpp.
+ 
+  // Choose a fresh mesh ID: one beyond the current maximum.
+  int mesh_id = 1;
+  for (const auto& m : model::meshes)
+    mesh_id = std::max(mesh_id, m->id_ + 1);
+ 
+  // openmc::LibMesh constructors (from include/openmc/mesh.h line 994):
+  //   LibMesh(const std::string& filename, double length_multiplier = 1.0)
+  //   LibMesh(libMesh::MeshBase& input_mesh, double length_multiplier = 1.0)
+  // There is no 3-argument constructor; ID is assigned separately via set_id().
+  auto lm_ptr = std::make_unique<openmc::LibMesh>(
+      mesh_file,   // Exodus file path
+      1.0          // length_multiplier (cm → cm, no conversion needed)
+  );
+  // Verify element count matches what we extracted in Step 2a.
+  if (static_cast<int>(lm_ptr->n_bins()) != n_elem)
+    fatal_error(fmt::format(
+        "<weight_windows_from_exodus>: element count mismatch between "
+        "standalone read ({}) and openmc::LibMesh ({}).",
+        n_elem, lm_ptr->n_bins()));
+ 
+  // Register in model::meshes first (set_id searches model::meshes for 'this'),
+  // then assign the ID via set_id() — which also writes model::mesh_map.
+  // This exactly mirrors the Mesh::create() pattern in mesh.cpp.
+  model::meshes.push_back(std::move(lm_ptr));
+  model::meshes.back()->set_id(mesh_id);
+ 
+  // ── Step 4: FW-CADIS normalisation → lower_ww_bounds; scale → upper_ww ────
+  //
+  // This exactly mirrors src/weight_windows.cpp WeightWindows::update_weights()
+  // for the FW_CADIS branch (lines ~850-890 of that file).
+  //
+  // FW-CADIS: weight windows are INVERSELY proportional to the adjoint flux.
+  //   Step A  invert:    importance[e] = 1 / phi_adj[e]
+  //   Step B  normalize: lower_ww[e]  = importance[e] / (2 * max(importance))
+  //                                   = min(phi_adj) / (2 * phi_adj[e])
+  //   upper_ww[e] = lower_ww[e] * upper_bound_ratio
+  //
+  // The factor of 2 in the denominator is OpenMC's convention: it centres the
+  // particle's nominal weight inside the window when upper_bound_ratio = 5
+  // (geometric mean ≈ 2.24 × lower_ww), matching what update_weights() does.
+  //
+  // Elements where phi_adj <= 0 have no importance for the detector; OpenMC
+  // stores -1.0 as the sentinel meaning "no window here" (the same value that
+  // update_weights() writes for bins where sum <= 0 or rel_err > threshold).
+  // The transport kernel skips windows whose lower bound is < 0, so those
+  // elements are simply left as analog Monte Carlo.
+ 
+  const double phi_max = *std::max_element(flux.begin(), flux.end());
+  if (phi_max <= 0.0)
+    fatal_error(fmt::format(
+        "<weight_windows_from_exodus>: max value of variable '{}' in '{}' "
+        "is {:g} <= 0.  Check variable name and time step index.",
+        flux_var, mesh_file, phi_max));
+ 
+  // Step A: invert adjoint flux; record max of inverted values.
+  // Elements with phi_adj <= 0 are flagged with inv = -1 (sentinel).
+  std::vector<double> inv(n_elem);
+  double inv_max = 0.0;
+  for (int i = 0; i < n_elem; ++i) {
+    if (flux[i] > 0.0) {
+      inv[i] = 1.0 / flux[i];          // importance ∝ 1/phi_adj
+      if (inv[i] > inv_max)
+        inv_max = inv[i];
+    } else {
+      inv[i] = -1.0;                    // sentinel: no window in this element
+    }
+  }
+ 
+  if (inv_max <= 0.0)
+    fatal_error(fmt::format(
+        "<weight_windows_from_exodus>: all values of variable '{}' in '{}' "
+        "are zero or negative — cannot compute FW-CADIS weight windows.",
+        flux_var, mesh_file));
+ 
+  // Step B: normalise by (2 * inv_max), matching OpenMC's update_weights().
+  const double norm_factor = 1.0 / (2.0 * inv_max);
+ 
+  std::vector<double> lower_ww(n_elem), upper_ww(n_elem);
+  for (int i = 0; i < n_elem; ++i) {
+    if (inv[i] < 0.0) {
+      // Zero-adjoint-flux element: no window (OpenMC sentinel -1).
+      lower_ww[i] = -1.0;
+      upper_ww[i] = -1.0;
+    } else {
+      lower_ww[i] = inv[i] * norm_factor;           // = 1/phi_adj / (2*max(1/phi_adj))
+      upper_ww[i] = lower_ww[i] * upper_bound_ratio; // upper bound
+    }
+  }
+ 
+  // ── Step 5: Build the WeightWindows object ────────────────────────────────
+  //
+  // From include/openmc/weight_windows.h (verified at commit fd1bc26a):
+  //   static WeightWindows* create(int32_t id = -1)
+  //     → pushes to variance_reduction::weight_windows, sets index_, registers
+  //       in ww_map, returns raw ptr
+  //   double& survival_ratio()   → non-const ref accessor, writable
+  //   void set_mesh(int32_t mesh_idx)
+  //   void set_particle_type(ParticleType)
+  //   void set_energy_bounds(span<const double>)
+  //   void set_bounds(span<const double> lower, span<const double> upper)
+  {
+    WeightWindows* wws = WeightWindows::create();
+    wws->set_mesh(model::mesh_map.at(mesh_id));
+    wws->set_particle_type(ParticleType {"neutron"});
+    wws->set_energy_bounds(
+        span<const double>(energy_bounds.data(), energy_bounds.size()));
+    // survival_ratio() returns a non-const reference (weight_windows.h line ~160)
+    wws->survival_ratio() = survival_ratio;
+    wws->set_bounds(
+        span<const double>(lower_ww.data(), lower_ww.size()),
+        span<const double>(upper_ww.data(), upper_ww.size()));
+  }
+ 
+  // ── Step 6: Enable weight windows globally ────────────────────────────────
+  // read_settings_xml() sets this flag inside the normal <weight_windows> loop;
+  // our path bypasses that loop, so we set it explicitly here.
+  settings::weight_windows_on = true;
+ 
+  write_message(fmt::format(
+      "Loaded adjoint weight windows from Exodus file '{}':\n"
+      "  {} elements, variable '{}', timestep {}, upper_bound_ratio {:g}.",
+      mesh_file, n_elem, flux_var,
+      (ts_user < 0 ? n_steps_saved - 1 : ts_user), upper_bound_ratio), 5);
+ 
+#endif  // OPENMC_LIBMESH_ENABLED
+}
+  
 void read_settings_xml()
 {
   using namespace settings;
@@ -1239,6 +1590,13 @@ void read_settings_xml(pugi::xml_node root)
     variance_reduction::weight_windows.emplace_back(
       std::make_unique<WeightWindows>(node_ww));
   }
+
+  // ────────────────────────────────────────────────────────
+  // If the user provided a <weight_windows_from_exodus> stanza, load the
+  // adjoint flux from the Exodus file and build WeightWindows in memory.
+  if (auto wwe = root.child("weight_windows_from_exodus"))
+    read_weight_windows_from_exodus(wwe);
+  // ────────────────────────────────────────────────────────────────────────
 
   // Enable weight windows by default if one or more are present
   if (variance_reduction::weight_windows.size() > 0)
